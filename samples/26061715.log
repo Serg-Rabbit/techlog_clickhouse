@@ -1,0 +1,5 @@
+00:01.000000-1000000,CALL,1,Context='Root
+CallPlace',Func=DoWork,CpuTime=400000
+00:00.500000-100000,SDBL,2,Context='CallPlace
+SDBLPlace',Func=Select,tableName=Catalog,Sdbl='SELECT * FROM Catalog',CpuTime=25000
+00:00.700000-50000,SDBL,2,Func=HoldConnection,tableName=Catalog,Sdbl='SELECT 1',CpuTime=1000

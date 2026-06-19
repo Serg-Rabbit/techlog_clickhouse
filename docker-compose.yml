@@ -1,0 +1,43 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: techlog-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: techlog
+      CLICKHOUSE_USER: techlog
+      CLICKHOUSE_PASSWORD: techlog
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  mongo:
+    image: mongo:7
+    container_name: techlog-hyperdx-mongo
+    volumes:
+      - mongo-data:/data/db
+
+  hyperdx:
+    image: docker.hyperdx.io/hyperdx/hyperdx
+    container_name: techlog-hyperdx
+    depends_on:
+      - clickhouse
+      - mongo
+    ports:
+      - "8088:8080"
+    environment:
+      MONGO_URI: mongodb://mongo:27017/hyperdx
+      HYPERDX_API_KEY: techlog-local-dev-key
+      FRONTEND_URL: http://localhost:8088
+      HYPERDX_LOG_LEVEL: info
+
+volumes:
+  clickhouse-data:
+  mongo-data:
