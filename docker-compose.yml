@@ -34,7 +34,7 @@ services:
     environment:
       MONGO_URI: mongodb://mongo:27017/hyperdx
       HYPERDX_API_KEY: techlog-local-dev-key
-      FRONTEND_URL: http://localhost:8088
+      FRONTEND_URL: ${HYPERDX_FRONTEND_URL:-http://10.0.10.24:8088}
       HYPERDX_LOG_LEVEL: info
 
 volumes:

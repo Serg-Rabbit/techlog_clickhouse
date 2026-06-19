@@ -17,7 +17,20 @@ Compose запускает:
 - ClickHouse на `http://localhost:8123`;
 - базу `techlog`;
 - пользователя `techlog` с паролем `techlog`;
-- HyperDX на `http://localhost:8088`.
+- HyperDX на `http://10.0.10.24:8088` по умолчанию.
+
+HyperDX использует `FRONTEND_URL` для редиректов после авторизации. В `docker-compose.yml` он берется из переменной `HYPERDX_FRONTEND_URL`, а если она не задана, используется `http://10.0.10.24:8088`. Для другого сервера или локального запуска задайте свой адрес:
+
+```powershell
+$env:HYPERDX_FRONTEND_URL = "http://localhost:8088"
+docker compose up -d
+```
+
+На Linux:
+
+```bash
+HYPERDX_FRONTEND_URL=http://10.0.10.24:8088 docker compose up -d
+```
 
 Native-порт ClickHouse `9000` не пробрасывается наружу, чтобы не конфликтовать с уже занятыми портами на сервере. Для импорта и команд этого проекта используется HTTP-порт `8123`. Если native-доступ с хоста всё-таки нужен, добавьте в `docker-compose.yml` свободный внешний порт, например:
 
