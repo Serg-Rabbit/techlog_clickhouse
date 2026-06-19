@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
@@ -62,6 +61,7 @@ struct Header {
 #[derive(Debug, Clone)]
 struct ParsedEvent {
     event_key: String,
+    line_no: u64,
     event_name: String,
     event_time_text: String,
     event_dt: String,
@@ -80,6 +80,21 @@ struct ParsedEvent {
     stack_text: String,
     file_path: String,
     raw_record: String,
+}
+
+#[derive(Debug, Default)]
+struct ParsedFields {
+    context: String,
+    cpu_time: String,
+    func: String,
+    form: String,
+    form_item: String,
+    iname: String,
+    mname: String,
+    method: String,
+    module: String,
+    sdbl: String,
+    table_name: String,
 }
 
 #[derive(Debug, Default)]
@@ -308,7 +323,7 @@ fn import_file(
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let file_path = path.to_string_lossy().to_string();
     let mut buf = Vec::with_capacity(8192);
-    let mut current_lines: Vec<String> = Vec::new();
+    let mut current_record = String::with_capacity(8192);
     let mut current_start_line = 0u64;
     let mut line_no = 0u64;
 
@@ -323,16 +338,11 @@ fn import_file(
         line_no += 1;
         stats.lines += 1;
         trim_newline_bytes(&mut buf);
-        let mut line = String::from_utf8_lossy(&buf).into_owned();
-        if line_no == 1 {
-            line = strip_utf8_bom(&line).to_string();
-        }
-        let start_event = event_name_at_record_start(&line);
 
-        if let Some(event_name) = start_event {
-            if !current_lines.is_empty() {
+        if let Some(event_name) = event_name_at_record_start_bytes(&buf) {
+            if !current_record.is_empty() {
                 process_record(
-                    &current_lines.join("\n"),
+                    &current_record,
                     &file_path,
                     current_start_line,
                     date.as_ref(),
@@ -341,20 +351,20 @@ fn import_file(
                     stats,
                 )?;
             }
-            current_lines.clear();
+            current_record.clear();
             current_start_line = 0;
-            if TARGET_EVENTS.contains(&event_name.as_str()) {
+            if is_target_event(event_name) {
                 current_start_line = line_no;
-                current_lines.push(line);
+                append_record_line(&mut current_record, &buf, line_no == 1);
             }
         } else if current_start_line != 0 {
-            current_lines.push(line);
+            append_record_line(&mut current_record, &buf, false);
         }
     }
 
-    if !current_lines.is_empty() {
+    if !current_record.is_empty() {
         process_record(
-            &current_lines.join("\n"),
+            &current_record,
             &file_path,
             current_start_line,
             date.as_ref(),
@@ -399,34 +409,24 @@ fn parse_record(
     }
 
     let fields = extract_fields(record, header.fields_start, &header.event_name);
-    let context = field(&fields, "Context");
-    let (first_context_line, last_context_line) = context_bounds(context);
-    let func = field(&fields, "Func").to_string();
-    let form = field(&fields, "Form").to_string();
-    let form_item = field(&fields, "FormItem").to_string();
-    let iname = field(&fields, "IName").to_string();
-    let mname = field(&fields, "MName").to_string();
-    let method = field(&fields, "Method").to_string();
-    let module = field(&fields, "Module").to_string();
-    let table_name = field(&fields, "tableName");
-    let sdbl = field(&fields, "Sdbl");
+    let (first_context_line, last_context_line) = context_bounds(&fields.context);
 
     let place = match header.event_name.as_str() {
         "CALL" => call_place(
             &last_context_line,
-            &module,
-            &method,
-            &func,
-            &form,
-            &form_item,
-            &iname,
-            &mname,
+            &fields.module,
+            &fields.method,
+            &fields.func,
+            &fields.form,
+            &fields.form_item,
+            &fields.iname,
+            &fields.mname,
         ),
-        "SDBL" => sdbl_place(&last_context_line, &func, table_name),
+        "SDBL" => sdbl_place(&last_context_line, &fields.func, &fields.table_name),
         _ => String::new(),
     };
 
-    let cpu_time_us = parse_number_u64(field(&fields, "CpuTime"));
+    let cpu_time_us = parse_number_u64(&fields.cpu_time);
     let event_dt = event_datetime(date, &header.time);
     let event_time_text = match date {
         Some(d) => format!("{}{}", d.text_prefix, header.time),
@@ -435,26 +435,23 @@ fn parse_record(
 
     Some(ParsedEvent {
         event_key: format!("{file_path}|{line_no}"),
+        line_no,
         event_name: header.event_name,
         event_time_text,
         event_dt,
         duration_us: header.duration_us,
         cpu_time_us,
-        func,
-        form,
-        form_item,
-        iname,
-        mname,
-        method,
-        module,
+        func: fields.func,
+        form: fields.form,
+        form_item: fields.form_item,
+        iname: fields.iname,
+        mname: fields.mname,
+        method: fields.method,
+        module: fields.module,
         place: truncate_chars(&place, 1000),
         first_context_line: truncate_chars(&first_context_line, 1000),
-        query_text: if sdbl.is_empty() {
-            String::new()
-        } else {
-            sdbl.to_string()
-        },
-        stack_text: context.to_string(),
+        query_text: fields.sdbl,
+        stack_text: fields.context,
         file_path: file_path.to_string(),
         raw_record: if store_raw_record {
             record.to_string()
@@ -464,16 +461,53 @@ fn parse_record(
     })
 }
 
+#[cfg(test)]
 fn event_name_at_record_start(line: &str) -> Option<String> {
-    let line = strip_utf8_bom(line);
     let bytes = line.as_bytes();
-    if bytes.len() < 7 || bytes.get(2) != Some(&b':') || bytes.get(5) != Some(&b'.') {
+    let event = event_name_at_record_start_bytes(bytes)?;
+    std::str::from_utf8(event).ok().map(str::to_string)
+}
+
+fn event_name_at_record_start_bytes(bytes: &[u8]) -> Option<&[u8]> {
+    let offset = if bytes.starts_with(b"\xef\xbb\xbf") {
+        3
+    } else {
+        0
+    };
+    if bytes.len() < offset + 7
+        || bytes.get(offset + 2) != Some(&b':')
+        || bytes.get(offset + 5) != Some(&b'.')
+    {
         return None;
     }
-    let first = line.find(',')?;
-    let rest = &line[first + 1..];
-    let second_rel = rest.find(',')?;
-    Some(rest[..second_rel].to_string())
+    let first = find_byte(bytes, offset, b',')?;
+    let second = find_byte(bytes, first + 1, b',')?;
+    Some(&bytes[first + 1..second])
+}
+
+fn is_target_event(event_name: &[u8]) -> bool {
+    event_name == b"CALL" || event_name == b"SDBL"
+}
+
+fn append_record_line(record: &mut String, bytes: &[u8], strip_bom: bool) {
+    if !record.is_empty() {
+        record.push('\n');
+    }
+    let bytes = if strip_bom && bytes.starts_with(b"\xef\xbb\xbf") {
+        &bytes[3..]
+    } else {
+        bytes
+    };
+    let line = String::from_utf8_lossy(bytes);
+    record.push_str(&line);
+}
+
+fn find_byte(bytes: &[u8], start: usize, needle: u8) -> Option<usize> {
+    bytes
+        .get(start..)?
+        .iter()
+        .position(|b| *b == needle)
+        .map(|rel| start + rel)
 }
 
 fn parse_header(record: &str) -> Option<Header> {
@@ -496,56 +530,76 @@ fn parse_header(record: &str) -> Option<Header> {
     })
 }
 
-fn extract_fields(record: &str, fields_start: usize, event_name: &str) -> HashMap<String, String> {
-    let mut fields = HashMap::new();
-    for name in ["Usr", "SessionID", "Context", "CpuTime", "Func"] {
-        add_field_if_exists(&mut fields, record, fields_start, name);
+fn extract_fields(record: &str, fields_start: usize, event_name: &str) -> ParsedFields {
+    let mut fields = ParsedFields::default();
+    if fields_start >= record.len() {
+        return fields;
     }
-    match event_name {
-        "CALL" => {
-            for name in [
-                "IName", "MName", "Module", "Method", "Report", "Form", "FormItem",
-            ] {
-                add_field_if_exists(&mut fields, record, fields_start, name);
-            }
+
+    let mut pos = fields_start;
+    while pos < record.len() {
+        while record.as_bytes().get(pos) == Some(&b',') {
+            pos += 1;
         }
-        "SDBL" => {
-            add_field_if_exists(&mut fields, record, fields_start, "Sdbl");
-            add_field_if_exists(&mut fields, record, fields_start, "tableName");
+        if pos >= record.len() {
+            break;
         }
-        _ => {}
+
+        let bytes = record.as_bytes();
+        let next_comma = find_byte(bytes, pos, b',');
+        let Some(eq) = find_byte(bytes, pos, b'=') else {
+            break;
+        };
+        if next_comma.is_some_and(|comma| comma < eq) {
+            pos = next_comma.unwrap() + 1;
+            continue;
+        }
+        let name = &record[pos..eq];
+        pos = if is_relevant_field(event_name, name) {
+            let (value, next_pos) = read_field_value(record, eq + 1);
+            set_field(&mut fields, event_name, name, value);
+            next_pos
+        } else {
+            skip_field_value(record, eq + 1)
+        };
+        if record.as_bytes().get(pos) == Some(&b',') {
+            pos += 1;
+        }
     }
+
     fields
 }
 
-fn add_field_if_exists(
-    fields: &mut HashMap<String, String>,
-    record: &str,
-    fields_start: usize,
-    name: &str,
-) {
-    if let Some(pos) = field_value_pos(record, fields_start, name) {
-        fields.insert(name.to_string(), read_field_value(record, pos));
+fn is_relevant_field(event_name: &str, name: &str) -> bool {
+    matches!(name, "Context" | "CpuTime" | "Func")
+        || (event_name == "CALL"
+            && matches!(
+                name,
+                "IName" | "MName" | "Module" | "Method" | "Form" | "FormItem"
+            ))
+        || (event_name == "SDBL" && matches!(name, "Sdbl" | "tableName"))
+}
+
+fn set_field(fields: &mut ParsedFields, event_name: &str, name: &str, value: String) {
+    match name {
+        "Context" => fields.context = value,
+        "CpuTime" => fields.cpu_time = value,
+        "Func" => fields.func = value,
+        "IName" if event_name == "CALL" => fields.iname = value,
+        "MName" if event_name == "CALL" => fields.mname = value,
+        "Module" if event_name == "CALL" => fields.module = value,
+        "Method" if event_name == "CALL" => fields.method = value,
+        "Form" if event_name == "CALL" => fields.form = value,
+        "FormItem" if event_name == "CALL" => fields.form_item = value,
+        "Sdbl" if event_name == "SDBL" => fields.sdbl = value,
+        "tableName" if event_name == "SDBL" => fields.table_name = value,
+        _ => {}
     }
 }
 
-fn field_value_pos(record: &str, fields_start: usize, name: &str) -> Option<usize> {
-    if fields_start >= record.len() {
-        return None;
-    }
-    let first_pattern = format!("{name}=");
-    if record[fields_start..].starts_with(&first_pattern) {
-        return Some(fields_start + first_pattern.len());
-    }
-    let pattern = format!(",{name}=");
-    record[fields_start..]
-        .find(&pattern)
-        .map(|rel| fields_start + rel + pattern.len())
-}
-
-fn read_field_value(record: &str, start: usize) -> String {
+fn read_field_value(record: &str, start: usize) -> (String, usize) {
     if start >= record.len() {
-        return String::new();
+        return (String::new(), record.len());
     }
     let bytes = record.as_bytes();
     let quote = bytes[start];
@@ -562,23 +616,39 @@ fn read_field_value(record: &str, start: usize) -> String {
                     continue;
                 }
                 out.push_str(&record[segment_start..pos]);
-                return out;
+                return (out, pos + 1);
             }
             pos += 1;
         }
         out.push_str(&record[segment_start..]);
-        return out;
+        return (out, record.len());
     }
 
-    let end = record[start..]
-        .find(',')
-        .map(|rel| start + rel)
-        .unwrap_or(record.len());
-    record[start..end].trim().to_string()
+    let end = find_byte(bytes, start, b',').unwrap_or(record.len());
+    (record[start..end].trim().to_string(), end)
 }
 
-fn field<'a>(fields: &'a HashMap<String, String>, name: &str) -> &'a str {
-    fields.get(name).map(String::as_str).unwrap_or("")
+fn skip_field_value(record: &str, start: usize) -> usize {
+    if start >= record.len() {
+        return record.len();
+    }
+    let bytes = record.as_bytes();
+    let quote = bytes[start];
+    if quote == b'\'' || quote == b'"' {
+        let mut pos = start + 1;
+        while pos < bytes.len() {
+            if bytes[pos] == quote {
+                if pos + 1 < bytes.len() && bytes[pos + 1] == quote {
+                    pos += 2;
+                    continue;
+                }
+                return pos + 1;
+            }
+            pos += 1;
+        }
+        return record.len();
+    }
+    find_byte(bytes, start, b',').unwrap_or(record.len())
 }
 
 fn context_bounds(context: &str) -> (String, String) {
@@ -819,8 +889,9 @@ impl InsertBatch {
     }
 }
 
-const INSERT_COLUMNS: [&str; 19] = [
+const INSERT_COLUMNS: [&str; 20] = [
     "event_key",
+    "line_no",
     "event_name",
     "event_time_text",
     "event_dt",
@@ -844,6 +915,7 @@ const INSERT_COLUMNS: [&str; 19] = [
 impl ParsedEvent {
     fn write_tsv(&self, out: &mut String) {
         write_tsv_str(out, &self.event_key, false);
+        write_tsv_u64(out, self.line_no, true);
         write_tsv_str(out, &self.event_name, true);
         write_tsv_str(out, &self.event_time_text, true);
         write_tsv_str(out, &self.event_dt, true);
@@ -867,6 +939,7 @@ impl ParsedEvent {
     fn write_json(&self, out: &mut String) {
         out.push('{');
         write_json_str(out, "event_key", &self.event_key, false);
+        write_json_u64(out, "line_no", self.line_no, true);
         write_json_str(out, "event_name", &self.event_name, true);
         write_json_str(out, "event_time_text", &self.event_time_text, true);
         write_json_str(out, "event_dt", &self.event_dt, true);
@@ -1058,8 +1131,9 @@ mod tests {
     #[test]
     fn parses_call_with_context_place() {
         let record = "00:00.010001-14922,CALL,1,Usr=u,SessionID=1,Context='A\nB',CpuTime=15625";
-        let event = parse_record(record, "a.log", 1, Some(&date()), false).unwrap();
+        let event = parse_record(record, "a.log", 42, Some(&date()), false).unwrap();
         assert_eq!(event.event_name, "CALL");
+        assert_eq!(event.line_no, 42);
         assert_eq!(event.place, "B");
         assert_eq!(event.first_context_line, "A");
         assert_eq!(event.duration_us, 14922);
@@ -1076,6 +1150,20 @@ mod tests {
         let fallback =
             "00:00.010001-1,CALL,1,Func=Call,Form=F,FormItem=I,IName=IN,MName=MN,Method=M";
         let event = parse_record(fallback, "a.log", 1, Some(&date()), false).unwrap();
+        assert_eq!(event.place, "Call: F I IN MN M");
+    }
+
+    #[test]
+    fn parses_multiple_typed_fields() {
+        let record = "00:00.010001-1,CALL,1,Usr=u,SessionID=1,Func=Call,Form=F,FormItem=I,IName=IN,MName=MN,Method=M,CpuTime=12";
+        let event = parse_record(record, "a.log", 5, Some(&date()), false).unwrap();
+        assert_eq!(event.func, "Call");
+        assert_eq!(event.form, "F");
+        assert_eq!(event.form_item, "I");
+        assert_eq!(event.iname, "IN");
+        assert_eq!(event.mname, "MN");
+        assert_eq!(event.method, "M");
+        assert_eq!(event.cpu_time_us, 12);
         assert_eq!(event.place, "Call: F I IN MN M");
     }
 
@@ -1115,7 +1203,18 @@ mod tests {
         let mut row = String::new();
         event.write_tsv(&mut row);
         assert!(!row.contains('\n'));
+        assert!(row.starts_with("a.log|1\t1\tSDBL\t"));
         assert!(row.contains("A\\nB\\tC"));
+    }
+
+    #[test]
+    fn json_includes_line_no() {
+        let record = "00:00.010022-8,SDBL,2,Sdbl='select'";
+        let event = parse_record(record, "a.log", 77, Some(&date()), false).unwrap();
+        let mut row = String::new();
+        event.write_json(&mut row);
+        assert!(row.contains("\"event_key\":\"a.log|77\""));
+        assert!(row.contains("\"line_no\":77"));
     }
 
     #[test]
