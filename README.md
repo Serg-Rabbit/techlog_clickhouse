@@ -4,6 +4,54 @@
 
 Текущая версия держит легкую схему: одна таблица `techlog.events`. Связи `SDBL -> CALL` и дочерние drilldown-таблицы не рассчитываются, чтобы не замедлять импорт большого файла.
 
+## Docker
+
+Поднять локальное окружение:
+
+```powershell
+docker compose up -d
+```
+
+Compose запускает:
+
+- ClickHouse на `http://localhost:8123`;
+- базу `techlog`;
+- пользователя `techlog` с паролем `techlog`;
+- HyperDX на `http://localhost:8088`.
+
+Native-порт ClickHouse `9000` не пробрасывается наружу, чтобы не конфликтовать с уже занятыми портами на сервере. Для импорта и команд этого проекта используется HTTP-порт `8123`. Если native-доступ с хоста всё-таки нужен, добавьте в `docker-compose.yml` свободный внешний порт, например:
+
+```yaml
+ports:
+  - "8123:8123"
+  - "19000:9000"
+```
+
+Схема ClickHouse автоматически применяется из `sql/init/001_schema.sql` при первом создании volume `clickhouse-data`. Если volume уже существовал, обновить схему можно командой:
+
+```powershell
+cargo run --release -- schema --host localhost --port 8123 --database techlog --user techlog --password techlog
+```
+
+Проверить доступность ClickHouse:
+
+```powershell
+docker compose ps
+docker exec -it techlog-clickhouse clickhouse-client --user techlog --password techlog --query "SELECT 1"
+```
+
+Остановить контейнеры:
+
+```powershell
+docker compose down
+```
+
+Полностью удалить данные ClickHouse и MongoDB:
+
+```powershell
+docker compose down -v
+```
+
 ## Команды
 
 Создать или обновить схему ClickHouse:
