@@ -1,0 +1,1 @@
+C:\Users\serg2\OneDrive\Документы\projects\techlog_clickhouse\target\debug\techlog-clickhouse.exe: C:\Users\serg2\OneDrive\Документы\projects\techlog_clickhouse\sql\init\001_schema.sql C:\Users\serg2\OneDrive\Документы\projects\techlog_clickhouse\src\main.rs

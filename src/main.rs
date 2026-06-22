@@ -62,6 +62,8 @@ struct Header {
 struct ParsedEvent {
     event_key: String,
     line_no: u64,
+    usr: String,
+    session_id: String,
     event_name: String,
     event_time_text: String,
     event_dt: String,
@@ -84,6 +86,8 @@ struct ParsedEvent {
 
 #[derive(Debug, Default)]
 struct ParsedFields {
+    usr: String,
+    session_id: String,
     context: String,
     cpu_time: String,
     func: String,
@@ -436,6 +440,8 @@ fn parse_record(
     Some(ParsedEvent {
         event_key: format!("{file_path}|{line_no}"),
         line_no,
+        usr: fields.usr,
+        session_id: fields.session_id,
         event_name: header.event_name,
         event_time_text,
         event_dt,
@@ -571,7 +577,7 @@ fn extract_fields(record: &str, fields_start: usize, event_name: &str) -> Parsed
 }
 
 fn is_relevant_field(event_name: &str, name: &str) -> bool {
-    matches!(name, "Context" | "CpuTime" | "Func")
+    matches!(name, "Usr" | "SessionID" | "Context" | "CpuTime" | "Func")
         || (event_name == "CALL"
             && matches!(
                 name,
@@ -582,6 +588,8 @@ fn is_relevant_field(event_name: &str, name: &str) -> bool {
 
 fn set_field(fields: &mut ParsedFields, event_name: &str, name: &str, value: String) {
     match name {
+        "Usr" => fields.usr = value,
+        "SessionID" => fields.session_id = value,
         "Context" => fields.context = value,
         "CpuTime" => fields.cpu_time = value,
         "Func" => fields.func = value,
@@ -889,9 +897,11 @@ impl InsertBatch {
     }
 }
 
-const INSERT_COLUMNS: [&str; 20] = [
+const INSERT_COLUMNS: [&str; 22] = [
     "event_key",
     "line_no",
+    "usr",
+    "session_id",
     "event_name",
     "event_time_text",
     "event_dt",
@@ -916,6 +926,8 @@ impl ParsedEvent {
     fn write_tsv(&self, out: &mut String) {
         write_tsv_str(out, &self.event_key, false);
         write_tsv_u64(out, self.line_no, true);
+        write_tsv_str(out, &self.usr, true);
+        write_tsv_str(out, &self.session_id, true);
         write_tsv_str(out, &self.event_name, true);
         write_tsv_str(out, &self.event_time_text, true);
         write_tsv_str(out, &self.event_dt, true);
@@ -940,6 +952,8 @@ impl ParsedEvent {
         out.push('{');
         write_json_str(out, "event_key", &self.event_key, false);
         write_json_u64(out, "line_no", self.line_no, true);
+        write_json_str(out, "usr", &self.usr, true);
+        write_json_str(out, "session_id", &self.session_id, true);
         write_json_str(out, "event_name", &self.event_name, true);
         write_json_str(out, "event_time_text", &self.event_time_text, true);
         write_json_str(out, "event_dt", &self.event_dt, true);
@@ -1134,6 +1148,8 @@ mod tests {
         let event = parse_record(record, "a.log", 42, Some(&date()), false).unwrap();
         assert_eq!(event.event_name, "CALL");
         assert_eq!(event.line_no, 42);
+        assert_eq!(event.usr, "u");
+        assert_eq!(event.session_id, "1");
         assert_eq!(event.place, "B");
         assert_eq!(event.first_context_line, "A");
         assert_eq!(event.duration_us, 14922);
@@ -1157,6 +1173,8 @@ mod tests {
     fn parses_multiple_typed_fields() {
         let record = "00:00.010001-1,CALL,1,Usr=u,SessionID=1,Func=Call,Form=F,FormItem=I,IName=IN,MName=MN,Method=M,CpuTime=12";
         let event = parse_record(record, "a.log", 5, Some(&date()), false).unwrap();
+        assert_eq!(event.usr, "u");
+        assert_eq!(event.session_id, "1");
         assert_eq!(event.func, "Call");
         assert_eq!(event.form, "F");
         assert_eq!(event.form_item, "I");
@@ -1198,23 +1216,25 @@ mod tests {
 
     #[test]
     fn tsv_escapes_row_breaking_chars() {
-        let record = "00:00.010022-8,SDBL,2,Context='A\nB\tC',Sdbl='select'";
+        let record = "00:00.010022-8,SDBL,2,Usr=u,SessionID=1,Context='A\nB\tC',Sdbl='select'";
         let event = parse_record(record, "a.log", 1, Some(&date()), true).unwrap();
         let mut row = String::new();
         event.write_tsv(&mut row);
         assert!(!row.contains('\n'));
-        assert!(row.starts_with("a.log|1\t1\tSDBL\t"));
+        assert!(row.starts_with("a.log|1\t1\tu\t1\tSDBL\t"));
         assert!(row.contains("A\\nB\\tC"));
     }
 
     #[test]
-    fn json_includes_line_no() {
-        let record = "00:00.010022-8,SDBL,2,Sdbl='select'";
+    fn json_includes_line_no_usr_and_session_id() {
+        let record = "00:00.010022-8,SDBL,2,Usr=u,SessionID=1,Sdbl='select'";
         let event = parse_record(record, "a.log", 77, Some(&date()), false).unwrap();
         let mut row = String::new();
         event.write_json(&mut row);
         assert!(row.contains("\"event_key\":\"a.log|77\""));
         assert!(row.contains("\"line_no\":77"));
+        assert!(row.contains("\"usr\":\"u\""));
+        assert!(row.contains("\"session_id\":\"1\""));
     }
 
     #[test]

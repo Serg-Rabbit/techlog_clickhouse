@@ -23,8 +23,16 @@ CREATE TABLE IF NOT EXISTS techlog.events
     first_context_line String,
     query_text String,
     stack_text String,
+    usr String,
+    session_id String,
     raw_record String
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(event_dt)
 ORDER BY (event_dt, event_name, place);
+
+ALTER TABLE techlog.events
+    ADD COLUMN IF NOT EXISTS usr String AFTER stack_text;
+
+ALTER TABLE techlog.events
+    ADD COLUMN IF NOT EXISTS session_id String AFTER usr;
