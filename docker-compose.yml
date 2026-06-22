@@ -2,6 +2,7 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: techlog-clickhouse
+    restart: unless-stopped
     ports:
       - "8123:8123"
     environment:
@@ -20,12 +21,14 @@ services:
   mongo:
     image: mongo:7
     container_name: techlog-hyperdx-mongo
+    restart: unless-stopped
     volumes:
       - mongo-data:/data/db
 
   hyperdx:
     image: docker.hyperdx.io/hyperdx/hyperdx
     container_name: techlog-hyperdx
+    restart: unless-stopped
     depends_on:
       - clickhouse
       - mongo
