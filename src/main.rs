@@ -3,7 +3,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -32,6 +32,8 @@ struct Config {
     count_lines: bool,
     watch_poll_seconds: u64,
     watch_stable_seconds: u64,
+    http_listen: Option<String>,
+    upload_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +172,8 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
         count_lines: false,
         watch_poll_seconds: DEFAULT_WATCH_POLL_SECONDS,
         watch_stable_seconds: DEFAULT_WATCH_STABLE_SECONDS,
+        http_listen: None,
+        upload_token: None,
     };
 
     if args.is_empty() {
@@ -250,6 +254,14 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                     .parse()
                     .map_err(|_| "--watch-stable-seconds must be a number".to_string())?;
             }
+            "--http-listen" => {
+                i += 1;
+                cfg.http_listen = Some(value_at(&args, i, "--http-listen")?.to_string());
+            }
+            "--upload-token" => {
+                i += 1;
+                cfg.upload_token = Some(value_at(&args, i, "--upload-token")?.to_string());
+            }
             "-h" | "--help" => cfg.command = Command::Help,
             other => return Err(format!("unknown option: {other}")),
         }
@@ -266,6 +278,18 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
     if matches!(cfg.command, Command::Watch) && cfg.truncate {
         return Err("--truncate is not supported in watch mode".to_string());
     }
+    if matches!(cfg.command, Command::Watch) && cfg.http_listen.is_some() {
+        if cfg.upload_token.as_deref().unwrap_or("").is_empty() {
+            cfg.upload_token = env::var("TECHLOG_UPLOAD_TOKEN")
+                .ok()
+                .filter(|value| !value.is_empty());
+        }
+        if cfg.upload_token.is_none() {
+            return Err(
+                "--upload-token or TECHLOG_UPLOAD_TOKEN is required with --http-listen".to_string(),
+            );
+        }
+    }
 
     Ok(cfg)
 }
@@ -278,7 +302,7 @@ fn value_at<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a st
 
 fn print_help() {
     println!(
-        "Использование:\n  cargo run --release -- schema [--host localhost --port 8123 --database techlog --user techlog --password techlog]\n  cargo run --release -- import --path \"Файлы техжурнала\" [--truncate] [--insert-format tsv|json] [--store-raw-record]\n  cargo run --release -- watch --path \"/inbox\" [--watch-poll-seconds 5] [--watch-stable-seconds 10]\n  cargo run --release -- scan --path \"Файлы техжурнала\" [--count-lines]"
+        "Использование:\n  cargo run --release -- schema [--host localhost --port 8123 --database techlog --user techlog --password techlog]\n  cargo run --release -- import --path \"Файлы техжурнала\" [--truncate] [--insert-format tsv|json] [--store-raw-record]\n  cargo run --release -- watch --path \"/inbox\" [--watch-poll-seconds 5] [--watch-stable-seconds 10] [--http-listen 0.0.0.0:8081 --upload-token secret]\n  cargo run --release -- scan --path \"Файлы техжурнала\" [--count-lines]"
     );
 }
 
@@ -366,6 +390,18 @@ fn run_watch(cfg: &Config) -> Result<(), String> {
             "watch --path must be a directory: {}",
             root.display()
         ));
+    }
+
+    if let Some(listen) = &cfg.http_listen {
+        let listener = TcpListener::bind(listen)
+            .map_err(|e| format!("bind upload server {listen} failed: {e}"))?;
+        let inbox = root.to_path_buf();
+        let token = cfg
+            .upload_token
+            .clone()
+            .ok_or_else(|| "upload token is required".to_string())?;
+        println!("upload server listening on {listen}");
+        thread::spawn(move || run_upload_server(listener, inbox, token));
     }
 
     loop {
@@ -488,7 +524,372 @@ fn process_watch_zip(path: &Path, inbox: &Path, cfg: &Config) -> Result<(), Stri
     }
 
     fs::remove_file(path).map_err(|e| format!("remove {} failed: {e}", path.display()))?;
+    if let Err(err) = fs::remove_dir_all(&archive_dir) {
+        eprintln!("remove {} failed: {err}", archive_dir.display());
+    }
     Ok(())
+}
+
+fn run_upload_server(listener: TcpListener, inbox: PathBuf, token: String) {
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let inbox = inbox.clone();
+                let token = token.clone();
+                thread::spawn(move || {
+                    if let Err(err) = handle_upload_connection(stream, &inbox, &token) {
+                        eprintln!("upload request failed: {err}");
+                    }
+                });
+            }
+            Err(err) => eprintln!("upload accept failed: {err}"),
+        }
+    }
+}
+
+fn handle_upload_connection(
+    mut stream: TcpStream,
+    inbox: &Path,
+    token: &str,
+) -> Result<(), String> {
+    let request = read_http_head(&mut stream)?;
+    let mut lines = request.split("\r\n");
+    let request_line = lines.next().ok_or_else(|| "empty request".to_string())?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts.next().unwrap_or("");
+    let path = request_parts.next().unwrap_or("");
+
+    let mut headers = HashMap::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let response = if method == "GET" && path == "/health" {
+        HttpResponse::ok("ok\n")
+    } else if method == "POST" && path == "/upload" {
+        match handle_upload_request(&mut stream, inbox, token, &headers) {
+            Ok(name) => HttpResponse::created(&format!("uploaded {name}\n")),
+            Err(err) => err.into_response(),
+        }
+    } else {
+        HttpResponse::new(404, "Not Found", "not found\n")
+    };
+
+    write_http_response(&mut stream, response)
+}
+
+fn handle_upload_request(
+    stream: &mut TcpStream,
+    inbox: &Path,
+    token: &str,
+    headers: &HashMap<String, String>,
+) -> Result<String, UploadHttpError> {
+    let expected_auth = format!("Bearer {token}");
+    if headers.get("authorization").map(String::as_str) != Some(expected_auth.as_str()) {
+        return Err(UploadHttpError::new(401, "Unauthorized", "unauthorized"));
+    }
+
+    let content_type = headers
+        .get("content-type")
+        .ok_or_else(|| UploadHttpError::bad_request("missing Content-Type"))?;
+    let boundary = multipart_boundary(content_type)
+        .ok_or_else(|| UploadHttpError::bad_request("missing multipart boundary"))?;
+    let content_length = headers
+        .get("content-length")
+        .ok_or_else(|| UploadHttpError::bad_request("missing Content-Length"))?
+        .parse::<u64>()
+        .map_err(|_| UploadHttpError::bad_request("bad Content-Length"))?;
+
+    let mut body = stream.take(content_length);
+    read_expected_boundary(&mut body, &boundary)?;
+    let part_headers = read_multipart_headers(&mut body)?;
+    let disposition = part_headers
+        .get("content-disposition")
+        .ok_or_else(|| UploadHttpError::bad_request("missing Content-Disposition"))?;
+    let field_name = header_param(disposition, "name")
+        .ok_or_else(|| UploadHttpError::bad_request("missing multipart field name"))?;
+    if field_name != "file" {
+        return Err(UploadHttpError::bad_request("multipart field must be file"));
+    }
+    let file_name = header_param(disposition, "filename")
+        .ok_or_else(|| UploadHttpError::bad_request("missing filename"))?;
+    let file_name = safe_upload_file_name(&file_name)?;
+
+    store_upload_part(&mut body, inbox, &file_name, &boundary)?;
+
+    Ok(file_name)
+}
+
+fn store_upload_part<R: Read>(
+    reader: &mut R,
+    inbox: &Path,
+    file_name: &str,
+    boundary: &str,
+) -> Result<(), UploadHttpError> {
+    let dest = inbox.join(file_name);
+    let temp = inbox.join(format!("{file_name}.uploading"));
+    if dest.exists() || temp.exists() {
+        return Err(UploadHttpError::new(409, "Conflict", "file already exists"));
+    }
+
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| UploadHttpError::server_error(format!("create temp file failed: {e}")))?;
+    if let Err(err) = copy_multipart_file_part(reader, &mut file, boundary) {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    file.flush()
+        .map_err(|e| UploadHttpError::server_error(format!("flush temp file failed: {e}")))?;
+    drop(file);
+    fs::rename(&temp, &dest)
+        .map_err(|e| UploadHttpError::server_error(format!("rename upload failed: {e}")))?;
+
+    Ok(())
+}
+
+fn read_http_head(stream: &mut TcpStream) -> Result<String, String> {
+    let mut buf = Vec::with_capacity(4096);
+    let mut byte = [0u8; 1];
+    while !buf.ends_with(b"\r\n\r\n") {
+        let read = stream
+            .read(&mut byte)
+            .map_err(|e| format!("read request failed: {e}"))?;
+        if read == 0 {
+            return Err("connection closed before headers".to_string());
+        }
+        buf.push(byte[0]);
+        if buf.len() > 32 * 1024 {
+            return Err("request headers are too large".to_string());
+        }
+    }
+    String::from_utf8(buf).map_err(|_| "request headers are not utf-8".to_string())
+}
+
+fn multipart_boundary(content_type: &str) -> Option<String> {
+    if !content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("multipart/form-data")
+    {
+        return None;
+    }
+    header_param(content_type, "boundary")
+}
+
+fn header_param(header: &str, name: &str) -> Option<String> {
+    for part in header.split(';').skip(1) {
+        let (key, value) = part.trim().split_once('=')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            let value = value.trim();
+            if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
+                return Some(value[1..value.len() - 1].replace("\\\"", "\""));
+            }
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn read_expected_boundary<R: Read>(reader: &mut R, boundary: &str) -> Result<(), UploadHttpError> {
+    let line = read_crlf_line(reader)?;
+    let expected = format!("--{boundary}");
+    if strip_crlf(&line) == expected.as_bytes() {
+        Ok(())
+    } else {
+        Err(UploadHttpError::bad_request("bad multipart boundary"))
+    }
+}
+
+fn read_multipart_headers<R: Read>(
+    reader: &mut R,
+) -> Result<HashMap<String, String>, UploadHttpError> {
+    let mut headers = HashMap::new();
+    loop {
+        let line = read_crlf_line(reader)?;
+        let line = strip_crlf(&line);
+        if line.is_empty() {
+            return Ok(headers);
+        }
+        let line = std::str::from_utf8(line)
+            .map_err(|_| UploadHttpError::bad_request("multipart header is not utf-8"))?;
+        let (name, value) = line
+            .split_once(':')
+            .ok_or_else(|| UploadHttpError::bad_request("bad multipart header"))?;
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+}
+
+fn read_crlf_line<R: Read>(reader: &mut R) -> Result<Vec<u8>, UploadHttpError> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while !line.ends_with(b"\n") {
+        let read = reader
+            .read(&mut byte)
+            .map_err(|e| UploadHttpError::server_error(format!("read body failed: {e}")))?;
+        if read == 0 {
+            return Err(UploadHttpError::bad_request("unexpected end of body"));
+        }
+        line.push(byte[0]);
+        if line.len() > 64 * 1024 {
+            return Err(UploadHttpError::bad_request("multipart line is too large"));
+        }
+    }
+    Ok(line)
+}
+
+fn strip_crlf(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r\n")
+        .or_else(|| line.strip_suffix(b"\n"))
+        .unwrap_or(line)
+}
+
+fn copy_multipart_file_part<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    boundary: &str,
+) -> Result<(), UploadHttpError> {
+    let pattern = format!("\r\n--{boundary}").into_bytes();
+    let keep = pattern.len().saturating_sub(1);
+    let mut pending = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+
+    loop {
+        let read = reader
+            .read(&mut buf)
+            .map_err(|e| UploadHttpError::server_error(format!("read upload failed: {e}")))?;
+        if read == 0 {
+            return Err(UploadHttpError::bad_request(
+                "multipart boundary was not found",
+            ));
+        }
+        pending.extend_from_slice(&buf[..read]);
+
+        if let Some(pos) = find_subslice(&pending, &pattern) {
+            writer
+                .write_all(&pending[..pos])
+                .map_err(|e| UploadHttpError::server_error(format!("write upload failed: {e}")))?;
+            return Ok(());
+        }
+
+        if pending.len() > keep {
+            let write_len = pending.len() - keep;
+            writer
+                .write_all(&pending[..write_len])
+                .map_err(|e| UploadHttpError::server_error(format!("write upload failed: {e}")))?;
+            pending.drain(..write_len);
+        }
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn safe_upload_file_name(file_name: &str) -> Result<String, UploadHttpError> {
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.contains("..")
+        || file_name.contains('/')
+        || file_name.contains('\\')
+        || file_name.chars().any(char::is_control)
+    {
+        return Err(UploadHttpError::bad_request("unsafe filename"));
+    }
+    let path = Path::new(file_name);
+    if path.file_name().and_then(|name| name.to_str()) != Some(file_name) {
+        return Err(UploadHttpError::bad_request("unsafe filename"));
+    }
+    if !(is_log_file(path) || is_zip_file(path)) {
+        return Err(UploadHttpError::new(
+            415,
+            "Unsupported Media Type",
+            "only .zip and .log files are accepted",
+        ));
+    }
+    Ok(file_name.to_string())
+}
+
+#[derive(Debug)]
+struct UploadHttpError {
+    status: u16,
+    reason: &'static str,
+    message: String,
+}
+
+impl UploadHttpError {
+    fn new(status: u16, reason: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(400, "Bad Request", message)
+    }
+
+    fn server_error(message: impl Into<String>) -> Self {
+        Self::new(500, "Internal Server Error", message)
+    }
+
+    fn into_response(self) -> HttpResponse {
+        HttpResponse::new(self.status, self.reason, &format!("{}\n", self.message))
+    }
+}
+
+struct HttpResponse {
+    status: u16,
+    reason: &'static str,
+    body: String,
+}
+
+impl HttpResponse {
+    fn new(status: u16, reason: &'static str, body: &str) -> Self {
+        Self {
+            status,
+            reason,
+            body: body.to_string(),
+        }
+    }
+
+    fn ok(body: &str) -> Self {
+        Self::new(200, "OK", body)
+    }
+
+    fn created(body: &str) -> Self {
+        Self::new(201, "Created", body)
+    }
+}
+
+fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result<(), String> {
+    let body = response.body.as_bytes();
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.status,
+        response.reason,
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|e| format!("write response failed: {e}"))
 }
 
 fn import_watch_log(path: &Path, cfg: &Config) -> Result<(), String> {
@@ -1446,6 +1847,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     use std::time::SystemTime;
     use zip::write::FileOptions;
 
@@ -1506,6 +1908,60 @@ mod tests {
 
         let err = extract_zip(&zip_path, &dest).unwrap_err();
         assert!(err.contains("unsafe zip path"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn upload_filename_accepts_only_safe_log_and_zip_names() {
+        assert_eq!(
+            safe_upload_file_name("26061518.zip").unwrap(),
+            "26061518.zip"
+        );
+        assert_eq!(
+            safe_upload_file_name("26061518.LOG").unwrap(),
+            "26061518.LOG"
+        );
+        assert_eq!(
+            safe_upload_file_name("../evil.log").unwrap_err().status,
+            400
+        );
+        assert_eq!(
+            safe_upload_file_name("nested/evil.log").unwrap_err().status,
+            400
+        );
+        assert_eq!(
+            safe_upload_file_name("nested\\evil.log")
+                .unwrap_err()
+                .status,
+            400
+        );
+        assert_eq!(safe_upload_file_name("notes.txt").unwrap_err().status, 415);
+    }
+
+    #[test]
+    fn upload_store_writes_temp_then_renames() {
+        let dir = unique_temp_dir("upload-store");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut body = Cursor::new(b"hello\r\n--boundary--\r\n".to_vec());
+        store_upload_part(&mut body, &dir, "26061518.log", "boundary").unwrap();
+
+        let final_path = dir.join("26061518.log");
+        let temp_path = dir.join("26061518.log.uploading");
+        assert_eq!(fs::read(&final_path).unwrap(), b"hello");
+        assert!(!temp_path.exists());
+        assert_eq!(
+            store_upload_part(
+                &mut Cursor::new(b"again\r\n--boundary--\r\n".to_vec()),
+                &dir,
+                "26061518.log",
+                "boundary"
+            )
+            .unwrap_err()
+            .status,
+            409
+        );
+
         fs::remove_dir_all(&dir).unwrap();
     }
 

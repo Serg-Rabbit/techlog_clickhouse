@@ -46,10 +46,16 @@ services:
     restart: unless-stopped
     depends_on:
       - clickhouse
+    ports:
+      - "18081:8081"
+    environment:
+      TECHLOG_UPLOAD_TOKEN: ${TECHLOG_UPLOAD_TOKEN:?set TECHLOG_UPLOAD_TOKEN in .env}
     command:
       - watch
       - --path
       - /inbox
+      - --http-listen
+      - 0.0.0.0:8081
       - --host
       - clickhouse
       - --port

@@ -10,7 +10,7 @@
 
 ```powershell
 Copy-Item .env.example .env
-# Отредактируйте .env: укажите TECHLOG_INBOX и HYPERDX_FRONTEND_URL
+# Отредактируйте .env: укажите TECHLOG_INBOX, TECHLOG_UPLOAD_TOKEN и HYPERDX_FRONTEND_URL
 docker compose up -d
 ```
 
@@ -20,14 +20,16 @@ Compose запускает:
 - базу `techlog`;
 - пользователя `techlog` с паролем `techlog`;
 - HyperDX на `http://10.0.10.24:8088` по умолчанию.
-- `techlog-loader`, который следит за папкой из `TECHLOG_INBOX`.
+- `techlog-loader`, который принимает файлы по HTTP и следит за папкой из `TECHLOG_INBOX`.
 
 `TECHLOG_INBOX` в `.env` должен указывать на папку, куда будут попадать `.zip` и `.log` файлы техжурнала. Docker пробрасывает эту папку внутрь контейнера как `/inbox`.
+`TECHLOG_UPLOAD_TOKEN` защищает HTTP-загрузку файлов в loader.
 
 Пример для Docker Desktop на Windows:
 
 ```env
 TECHLOG_INBOX=C:\techlog-inbox
+TECHLOG_UPLOAD_TOKEN=change-me
 HYPERDX_FRONTEND_URL=http://localhost:8088
 ```
 
@@ -35,6 +37,7 @@ HYPERDX_FRONTEND_URL=http://localhost:8088
 
 ```env
 TECHLOG_INBOX=/mnt/techlog-inbox
+TECHLOG_UPLOAD_TOKEN=change-me
 HYPERDX_FRONTEND_URL=http://10.0.10.24:8088
 ```
 
@@ -53,9 +56,23 @@ HYPERDX_FRONTEND_URL=http://10.0.10.24:8088 docker compose up -d
 
 ### Автозагрузка техжурнала
 
-`techlog-loader` автоматически обрабатывает файлы в `/inbox`:
+`techlog-loader` принимает `.zip` и `.log` по HTTP на порту `18081` и сохраняет их в `/inbox`. Пример загрузки с Windows:
 
-- `.zip`: ждет окончания копирования, распаковывает в `/inbox/_extracted/<имя архива>/`, импортирует все найденные `.log`, затем удаляет исходный `.zip`;
+```powershell
+curl.exe -H "Authorization: Bearer change-me" `
+  -F "file=@C:\path\26061518.zip" `
+  http://10.0.10.24:18081/upload
+```
+
+Проверить, что upload endpoint жив:
+
+```powershell
+curl.exe http://10.0.10.24:18081/health
+```
+
+После сохранения файла `techlog-loader` автоматически обрабатывает файлы в `/inbox`:
+
+- `.zip`: ждет окончания копирования, распаковывает в `/inbox/_extracted/<имя архива>/`, импортирует все найденные `.log`, затем удаляет исходный `.zip` и папку распаковки;
 - `.log`: ждет окончания копирования, импортирует файл, затем удаляет исходный `.log`.
 
 Перед загрузкой каждого `.log` loader удаляет старые строки с таким же `file_path`, чтобы повторная загрузка того же файла не создавала дубли.
