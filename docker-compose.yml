@@ -40,6 +40,29 @@ services:
       FRONTEND_URL: ${HYPERDX_FRONTEND_URL:-http://10.0.10.24:8088}
       HYPERDX_LOG_LEVEL: info
 
+  techlog-loader:
+    build: .
+    container_name: techlog-loader
+    restart: unless-stopped
+    depends_on:
+      - clickhouse
+    command:
+      - watch
+      - --path
+      - /inbox
+      - --host
+      - clickhouse
+      - --port
+      - "8123"
+      - --database
+      - techlog
+      - --user
+      - techlog
+      - --password
+      - techlog
+    volumes:
+      - ${TECHLOG_INBOX:?set TECHLOG_INBOX in .env}:/inbox
+
 volumes:
   clickhouse-data:
   mongo-data:

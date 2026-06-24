@@ -9,6 +9,8 @@
 Поднять локальное окружение:
 
 ```powershell
+Copy-Item .env.example .env
+# Отредактируйте .env: укажите TECHLOG_INBOX и HYPERDX_FRONTEND_URL
 docker compose up -d
 ```
 
@@ -18,6 +20,23 @@ Compose запускает:
 - базу `techlog`;
 - пользователя `techlog` с паролем `techlog`;
 - HyperDX на `http://10.0.10.24:8088` по умолчанию.
+- `techlog-loader`, который следит за папкой из `TECHLOG_INBOX`.
+
+`TECHLOG_INBOX` в `.env` должен указывать на папку, куда будут попадать `.zip` и `.log` файлы техжурнала. Docker пробрасывает эту папку внутрь контейнера как `/inbox`.
+
+Пример для Docker Desktop на Windows:
+
+```env
+TECHLOG_INBOX=C:\techlog-inbox
+HYPERDX_FRONTEND_URL=http://localhost:8088
+```
+
+Пример для Linux-сервера, где Windows-шара уже примонтирована в `/mnt/techlog-inbox`:
+
+```env
+TECHLOG_INBOX=/mnt/techlog-inbox
+HYPERDX_FRONTEND_URL=http://10.0.10.24:8088
+```
 
 HyperDX использует `FRONTEND_URL` для редиректов после авторизации. В `docker-compose.yml` он берется из переменной `HYPERDX_FRONTEND_URL`, а если она не задана, используется `http://10.0.10.24:8088`. Для другого сервера или локального запуска задайте свой адрес:
 
@@ -30,6 +49,27 @@ docker compose up -d
 
 ```bash
 HYPERDX_FRONTEND_URL=http://10.0.10.24:8088 docker compose up -d
+```
+
+### Автозагрузка техжурнала
+
+`techlog-loader` автоматически обрабатывает файлы в `/inbox`:
+
+- `.zip`: ждет окончания копирования, распаковывает в `/inbox/_extracted/<имя архива>/`, импортирует все найденные `.log`, затем удаляет исходный `.zip`;
+- `.log`: ждет окончания копирования, импортирует файл, затем удаляет исходный `.log`.
+
+Перед загрузкой каждого `.log` loader удаляет старые строки с таким же `file_path`, чтобы повторная загрузка того же файла не создавала дубли.
+
+Посмотреть логи загрузчика:
+
+```powershell
+docker logs -f techlog-loader
+```
+
+Пересобрать loader после изменения Rust-кода:
+
+```powershell
+docker compose up -d --build techlog-loader
 ```
 
 Native-порт ClickHouse `9000` не пробрасывается наружу, чтобы не конфликтовать с уже занятыми портами на сервере. Для импорта и команд этого проекта используется HTTP-порт `8123`. Если native-доступ с хоста всё-таки нужен, добавьте в `docker-compose.yml` свободный внешний порт, например:

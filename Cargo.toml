@@ -3,7 +3,9 @@ name = "techlog-clickhouse"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+
 [profile.release]
 lto = true
 codegen-units = 1
-

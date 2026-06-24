@@ -1,14 +1,19 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+use zip::ZipArchive;
 
 const TARGET_EVENTS: [&str; 2] = ["CALL", "SDBL"];
 const DEFAULT_BATCH_ROWS: usize = 100_000;
 const DEFAULT_BATCH_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_WATCH_POLL_SECONDS: u64 = 5;
+const DEFAULT_WATCH_STABLE_SECONDS: u64 = 10;
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -25,6 +30,8 @@ struct Config {
     store_raw_record: bool,
     truncate: bool,
     count_lines: bool,
+    watch_poll_seconds: u64,
+    watch_stable_seconds: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +39,7 @@ enum Command {
     Schema,
     Import,
     Scan,
+    Watch,
     Help,
 }
 
@@ -112,6 +120,18 @@ struct ImportStats {
     errors: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileState {
+    len: u64,
+    modified_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+struct WatchedFile {
+    state: FileState,
+    unchanged_since: Instant,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -129,6 +149,7 @@ fn run() -> Result<(), String> {
         Command::Schema => run_schema(&cfg),
         Command::Scan => run_scan(&cfg),
         Command::Import => run_import(&cfg),
+        Command::Watch => run_watch(&cfg),
     }
 }
 
@@ -147,6 +168,8 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
         store_raw_record: false,
         truncate: false,
         count_lines: false,
+        watch_poll_seconds: DEFAULT_WATCH_POLL_SECONDS,
+        watch_stable_seconds: DEFAULT_WATCH_STABLE_SECONDS,
     };
 
     if args.is_empty() {
@@ -157,6 +180,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
         "schema" => Command::Schema,
         "import" => Command::Import,
         "scan" => Command::Scan,
+        "watch" => Command::Watch,
         "help" | "-h" | "--help" => Command::Help,
         other => return Err(format!("unknown command: {other}")),
     };
@@ -214,14 +238,33 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
             "--store-raw-record" => cfg.store_raw_record = true,
             "--truncate" => cfg.truncate = true,
             "--count-lines" => cfg.count_lines = true,
+            "--watch-poll-seconds" => {
+                i += 1;
+                cfg.watch_poll_seconds = value_at(&args, i, "--watch-poll-seconds")?
+                    .parse()
+                    .map_err(|_| "--watch-poll-seconds must be a number".to_string())?;
+            }
+            "--watch-stable-seconds" => {
+                i += 1;
+                cfg.watch_stable_seconds = value_at(&args, i, "--watch-stable-seconds")?
+                    .parse()
+                    .map_err(|_| "--watch-stable-seconds must be a number".to_string())?;
+            }
             "-h" | "--help" => cfg.command = Command::Help,
             other => return Err(format!("unknown option: {other}")),
         }
         i += 1;
     }
 
-    if matches!(cfg.command, Command::Import | Command::Scan) && cfg.path.is_none() {
+    if matches!(
+        cfg.command,
+        Command::Import | Command::Scan | Command::Watch
+    ) && cfg.path.is_none()
+    {
         return Err("--path is required".to_string());
+    }
+    if matches!(cfg.command, Command::Watch) && cfg.truncate {
+        return Err("--truncate is not supported in watch mode".to_string());
     }
 
     Ok(cfg)
@@ -235,7 +278,7 @@ fn value_at<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a st
 
 fn print_help() {
     println!(
-        "Использование:\n  cargo run --release -- schema [--host localhost --port 8123 --database techlog --user techlog --password techlog]\n  cargo run --release -- import --path \"Файлы техжурнала\" [--truncate] [--insert-format tsv|json] [--store-raw-record]\n  cargo run --release -- scan --path \"Файлы техжурнала\" [--count-lines]"
+        "Использование:\n  cargo run --release -- schema [--host localhost --port 8123 --database techlog --user techlog --password techlog]\n  cargo run --release -- import --path \"Файлы техжурнала\" [--truncate] [--insert-format tsv|json] [--store-raw-record]\n  cargo run --release -- watch --path \"/inbox\" [--watch-poll-seconds 5] [--watch-stable-seconds 10]\n  cargo run --release -- scan --path \"Файлы техжурнала\" [--count-lines]"
     );
 }
 
@@ -314,6 +357,174 @@ fn run_import(cfg: &Config) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn run_watch(cfg: &Config) -> Result<(), String> {
+    let root = cfg.path.as_ref().expect("validated path");
+    if !root.is_dir() {
+        return Err(format!(
+            "watch --path must be a directory: {}",
+            root.display()
+        ));
+    }
+
+    loop {
+        match run_schema(cfg) {
+            Ok(()) => break,
+            Err(err) => {
+                eprintln!("schema is not ready yet: {err}");
+                thread::sleep(Duration::from_secs(cfg.watch_poll_seconds.max(1)));
+            }
+        }
+    }
+    println!(
+        "watching {} for .zip and .log files; poll={}s stable={}s",
+        root.display(),
+        cfg.watch_poll_seconds,
+        cfg.watch_stable_seconds
+    );
+
+    let mut watched: HashMap<PathBuf, WatchedFile> = HashMap::new();
+    let poll = Duration::from_secs(cfg.watch_poll_seconds.max(1));
+    let stable = Duration::from_secs(cfg.watch_stable_seconds.max(1));
+
+    loop {
+        match collect_watch_files(root) {
+            Ok(files) => {
+                let now = Instant::now();
+                let mut present = HashMap::new();
+                let mut ready = Vec::new();
+
+                for path in files {
+                    present.insert(path.clone(), ());
+                    match file_state(&path) {
+                        Ok(state) => {
+                            let entry = watched.entry(path.clone()).or_insert(WatchedFile {
+                                state,
+                                unchanged_since: now,
+                            });
+                            if entry.state == state {
+                                if file_is_stable(entry.unchanged_since, now, stable) {
+                                    ready.push(path);
+                                }
+                            } else {
+                                entry.state = state;
+                                entry.unchanged_since = now;
+                            }
+                        }
+                        Err(err) => eprintln!("watch state error {}: {err}", path.display()),
+                    }
+                }
+
+                watched.retain(|path, _| present.contains_key(path));
+
+                for path in ready {
+                    println!("processing {}", path.display());
+                    match process_watch_path(&path, root, cfg) {
+                        Ok(()) => {
+                            watched.remove(&path);
+                            println!("processed {}", path.display());
+                        }
+                        Err(err) => {
+                            eprintln!("processing failed {}: {err}", path.display());
+                            if let Some(entry) = watched.get_mut(&path) {
+                                entry.unchanged_since = Instant::now();
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => eprintln!("watch scan error {}: {err}", root.display()),
+        }
+
+        thread::sleep(poll);
+    }
+}
+
+fn collect_watch_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", root.display()))?;
+        let path = entry.path();
+        if path.is_file() && (is_log_file(&path) || is_zip_file(&path)) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn process_watch_path(path: &Path, inbox: &Path, cfg: &Config) -> Result<(), String> {
+    if is_zip_file(path) {
+        process_watch_zip(path, inbox, cfg)?;
+    } else if is_log_file(path) {
+        import_watch_log(path, cfg)?;
+        fs::remove_file(path).map_err(|e| format!("remove {} failed: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn process_watch_zip(path: &Path, inbox: &Path, cfg: &Config) -> Result<(), String> {
+    let extract_root = inbox.join("_extracted");
+    fs::create_dir_all(&extract_root)
+        .map_err(|e| format!("create {} failed: {e}", extract_root.display()))?;
+    let archive_dir = extract_root.join(safe_archive_dir_name(path));
+    if archive_dir.exists() {
+        ensure_child_path(&extract_root, &archive_dir)?;
+        fs::remove_dir_all(&archive_dir)
+            .map_err(|e| format!("remove {} failed: {e}", archive_dir.display()))?;
+    }
+    fs::create_dir_all(&archive_dir)
+        .map_err(|e| format!("create {} failed: {e}", archive_dir.display()))?;
+
+    extract_zip(path, &archive_dir)?;
+    let logs = collect_log_files(&archive_dir)?;
+    if logs.is_empty() {
+        return Err(format!("no .log files found in {}", path.display()));
+    }
+
+    for log in logs {
+        import_watch_log(&log, cfg)?;
+    }
+
+    fs::remove_file(path).map_err(|e| format!("remove {} failed: {e}", path.display()))?;
+    Ok(())
+}
+
+fn import_watch_log(path: &Path, cfg: &Config) -> Result<(), String> {
+    let started = Instant::now();
+    let file_path = path.to_string_lossy().to_string();
+    delete_events_for_file(cfg, &file_path)?;
+
+    let mut stats = ImportStats::default();
+    let mut batch = InsertBatch::new(cfg);
+    stats.files += 1;
+    stats.bytes = fs::metadata(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?
+        .len();
+    import_file(path, cfg, &mut batch, &mut stats)?;
+    batch.flush(cfg, &mut stats)?;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    println!(
+        "imported {}: lines={} records={} inserted={} skipped={} seconds={:.3}",
+        path.display(),
+        stats.lines,
+        stats.records,
+        stats.inserted,
+        stats.skipped,
+        elapsed
+    );
+    Ok(())
+}
+
+fn delete_events_for_file(cfg: &Config, file_path: &str) -> Result<(), String> {
+    let sql = format!(
+        "ALTER TABLE {}.events DELETE WHERE file_path = {} SETTINGS mutations_sync = 1",
+        ident(&cfg.database),
+        sql_string_literal(file_path)
+    );
+    clickhouse_query(cfg, &sql)
 }
 
 fn import_file(
@@ -816,6 +1027,96 @@ fn is_log_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_zip_file(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().eq_ignore_ascii_case("zip"))
+        .unwrap_or(false)
+}
+
+fn file_state(path: &Path) -> Result<FileState, String> {
+    let metadata = fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let modified_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    Ok(FileState {
+        len: metadata.len(),
+        modified_secs,
+    })
+}
+
+fn file_is_stable(unchanged_since: Instant, now: Instant, stable_for: Duration) -> bool {
+    now.duration_since(unchanged_since) >= stable_for
+}
+
+fn extract_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
+    let file = File::open(zip_path).map_err(|e| format!("{}: {e}", zip_path.display()))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|e| format!("{}: invalid zip: {e}", zip_path.display()))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("{}: zip entry {index}: {e}", zip_path.display()))?;
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("{}: unsafe zip path: {}", zip_path.display(), entry.name()))?;
+        let out_path = dest.join(enclosed);
+        ensure_child_path(dest, &out_path)?;
+
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path)
+                .map_err(|e| format!("create {} failed: {e}", out_path.display()))?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("create {} failed: {e}", parent.display()))?;
+        }
+        let mut out_file = File::create(&out_path)
+            .map_err(|e| format!("create {} failed: {e}", out_path.display()))?;
+        std::io::copy(&mut entry, &mut out_file)
+            .map_err(|e| format!("extract {} failed: {e}", out_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn ensure_child_path(root: &Path, child: &Path) -> Result<(), String> {
+    if child.starts_with(root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "path {} escapes {}",
+            child.display(),
+            root.display()
+        ))
+    }
+}
+
+fn safe_archive_dir_name(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy())
+        .unwrap_or_else(|| "archive".into());
+    let mut out = String::new();
+    for ch in stem.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "archive".to_string()
+    } else {
+        out
+    }
+}
+
 fn count_lines(path: &Path) -> Result<u64, String> {
     let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
@@ -1124,6 +1425,20 @@ fn ident(value: &str) -> String {
     value.to_string()
 }
 
+fn sql_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
@@ -1131,6 +1446,8 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+    use zip::write::FileOptions;
 
     fn date() -> FileDate {
         FileDate {
@@ -1140,6 +1457,56 @@ mod tests {
             hour: 15,
             text_prefix: "17.06.2026 15:".to_string(),
         }
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("techlog-clickhouse-{name}-{nanos}"))
+    }
+
+    #[test]
+    fn sql_string_literal_escapes_quotes() {
+        assert_eq!(sql_string_literal("a'b\\c"), "'a''b\\c'");
+    }
+
+    #[test]
+    fn file_stability_uses_unchanged_duration() {
+        let start = Instant::now();
+        assert!(!file_is_stable(
+            start,
+            start + Duration::from_secs(9),
+            Duration::from_secs(10)
+        ));
+        assert!(file_is_stable(
+            start,
+            start + Duration::from_secs(10),
+            Duration::from_secs(10)
+        ));
+    }
+
+    #[test]
+    fn zip_extract_rejects_zip_slip_paths() {
+        let dir = unique_temp_dir("zip-slip");
+        fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("bad.zip");
+        let dest = dir.join("out");
+        fs::create_dir_all(&dest).unwrap();
+
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("../evil.log", FileOptions::default())
+                .unwrap();
+            zip.write_all(b"bad").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let err = extract_zip(&zip_path, &dest).unwrap_err();
+        assert!(err.contains("unsafe zip path"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
