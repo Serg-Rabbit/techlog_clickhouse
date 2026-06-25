@@ -1,6 +1,6 @@
 # Техжурнал ClickHouse
 
-Быстрый анализатор событий `CALL` и `SDBL` из технологического журнала 1С.
+Быстрый анализатор событий `CALL`, `SDBL` и HTTP-пар `VRSREQUEST/VRSRESPONSE` из технологического журнала 1С.
 
 Текущая версия держит легкую схему: одна таблица `techlog.events`. Связи `SDBL -> CALL` и дочерние drilldown-таблицы не рассчитываются, чтобы не замедлять импорт большого файла.
 
@@ -145,7 +145,9 @@ cargo run --release -- scan --path "Файлы техжурнала" --count-lin
 cargo run --release -- import --path "Файлы техжурнала" --host localhost --port 8123 --database techlog --user techlog --password techlog
 ```
 
-Импорт делает только создание схемы, опциональную очистку `techlog.events`, потоковое чтение `.log` файлов и батчевую вставку `CALL/SDBL` в ClickHouse.
+Импорт делает только создание схемы, опциональную очистку `techlog.events`, потоковое чтение `.log` файлов и батчевую вставку `CALL`, `SDBL` и свернутых HTTP-пар `VRSREQUEST/VRSRESPONSE` как `VRSREQRESP` в ClickHouse.
+
+Для `VRSREQRESP` поле `place` заполняется как `Method URI`, а `first_context_line` содержит HTTP-статус ответа.
 
 Импорт по умолчанию оптимизирован по скорости:
 

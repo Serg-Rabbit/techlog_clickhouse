@@ -9,7 +9,6 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use zip::ZipArchive;
 
-const TARGET_EVENTS: [&str; 2] = ["CALL", "SDBL"];
 const DEFAULT_BATCH_ROWS: usize = 100_000;
 const DEFAULT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_WATCH_POLL_SECONDS: u64 = 5;
@@ -100,6 +99,11 @@ struct ParsedEvent {
 struct ParsedFields {
     usr: String,
     session_id: String,
+    process: String,
+    process_name: String,
+    os_thread: String,
+    client_id: String,
+    connect_id: String,
     context: String,
     cpu_time: String,
     func: String,
@@ -110,7 +114,29 @@ struct ParsedFields {
     method: String,
     module: String,
     sdbl: String,
+    status: String,
     table_name: String,
+    uri: String,
+    vrs_method: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct VrsKey {
+    process: String,
+    process_name: String,
+    os_thread: String,
+    client_id: String,
+    connect_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingVrsRequest {
+    header: Header,
+    line_no: u64,
+    file_path: String,
+    method: String,
+    uri: String,
+    raw_record: String,
 }
 
 #[derive(Debug, Default)]
@@ -949,6 +975,7 @@ fn import_file(
     let mut current_record = String::with_capacity(8192);
     let mut current_start_line = 0u64;
     let mut line_no = 0u64;
+    let mut pending_vrs: HashMap<VrsKey, PendingVrsRequest> = HashMap::new();
 
     loop {
         buf.clear();
@@ -972,6 +999,7 @@ fn import_file(
                     cfg,
                     batch,
                     stats,
+                    &mut pending_vrs,
                 )?;
             }
             current_record.clear();
@@ -994,8 +1022,11 @@ fn import_file(
             cfg,
             batch,
             stats,
+            &mut pending_vrs,
         )?;
     }
+
+    stats.skipped += pending_vrs.len() as u64;
 
     Ok(())
 }
@@ -1008,8 +1039,35 @@ fn process_record(
     cfg: &Config,
     batch: &mut InsertBatch,
     stats: &mut ImportStats,
+    pending_vrs: &mut HashMap<VrsKey, PendingVrsRequest>,
 ) -> Result<(), String> {
     stats.records += 1;
+    let Some(header) = parse_header(record) else {
+        stats.skipped += 1;
+        return Ok(());
+    };
+    match header.event_name.as_str() {
+        "VRSREQUEST" => {
+            match parse_vrs_request(record, file_path, line_no, header, cfg.store_raw_record) {
+                Some((key, request)) => {
+                    if pending_vrs.insert(key, request).is_some() {
+                        stats.skipped += 1;
+                    }
+                }
+                None => stats.skipped += 1,
+            }
+            return Ok(());
+        }
+        "VRSRESPONSE" => {
+            match parse_vrs_response(record, date, header, pending_vrs, cfg.store_raw_record) {
+                Some(event) => batch.push(&event, cfg, stats)?,
+                None => stats.skipped += 1,
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
     match parse_record(record, file_path, line_no, date, cfg.store_raw_record) {
         Some(event) => batch.push(&event, cfg, stats),
         None => {
@@ -1027,7 +1085,7 @@ fn parse_record(
     store_raw_record: bool,
 ) -> Option<ParsedEvent> {
     let header = parse_header(record)?;
-    if !TARGET_EVENTS.contains(&header.event_name.as_str()) {
+    if !matches!(header.event_name.as_str(), "CALL" | "SDBL") {
         return None;
     }
 
@@ -1086,6 +1144,104 @@ fn parse_record(
     })
 }
 
+fn parse_vrs_request(
+    record: &str,
+    file_path: &str,
+    line_no: u64,
+    header: Header,
+    store_raw_record: bool,
+) -> Option<(VrsKey, PendingVrsRequest)> {
+    let fields = extract_fields(record, header.fields_start, &header.event_name);
+    let key = vrs_key(&fields)?;
+    let request = PendingVrsRequest {
+        header,
+        line_no,
+        file_path: file_path.to_string(),
+        method: fields.vrs_method,
+        uri: fields.uri,
+        raw_record: if store_raw_record {
+            record.to_string()
+        } else {
+            String::new()
+        },
+    };
+    Some((key, request))
+}
+
+fn parse_vrs_response(
+    record: &str,
+    date: Option<&FileDate>,
+    header: Header,
+    pending_vrs: &mut HashMap<VrsKey, PendingVrsRequest>,
+    store_raw_record: bool,
+) -> Option<ParsedEvent> {
+    let fields = extract_fields(record, header.fields_start, &header.event_name);
+    let key = vrs_key(&fields)?;
+    let request = pending_vrs.remove(&key)?;
+    let place = [request.method.trim(), request.uri.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let event_dt = event_datetime(date, &request.header.time);
+    let event_time_text = match date {
+        Some(d) => format!("{}{}", d.text_prefix, request.header.time),
+        None => request.header.time.clone(),
+    };
+    let raw_record = if store_raw_record {
+        if request.raw_record.is_empty() {
+            record.to_string()
+        } else {
+            format!("{}\n{}", request.raw_record, record)
+        }
+    } else {
+        String::new()
+    };
+
+    Some(ParsedEvent {
+        event_key: format!("{}|{}", request.file_path, request.line_no),
+        line_no: request.line_no,
+        usr: String::new(),
+        session_id: String::new(),
+        event_name: "VRSREQRESP".to_string(),
+        event_time_text,
+        event_dt,
+        duration_us: duration_between_event_times_us(&request.header.time, &header.time),
+        cpu_time_us: 0,
+        func: String::new(),
+        form: String::new(),
+        form_item: String::new(),
+        iname: String::new(),
+        mname: String::new(),
+        method: String::new(),
+        module: String::new(),
+        place: truncate_chars(&place, 1000),
+        first_context_line: truncate_chars(&fields.status, 1000),
+        query_text: String::new(),
+        stack_text: String::new(),
+        file_path: request.file_path,
+        raw_record,
+    })
+}
+
+fn vrs_key(fields: &ParsedFields) -> Option<VrsKey> {
+    if fields.process.is_empty()
+        || fields.process_name.is_empty()
+        || fields.os_thread.is_empty()
+        || fields.client_id.is_empty()
+        || fields.connect_id.is_empty()
+    {
+        return None;
+    }
+    Some(VrsKey {
+        process: fields.process.clone(),
+        process_name: fields.process_name.clone(),
+        os_thread: fields.os_thread.clone(),
+        client_id: fields.client_id.clone(),
+        connect_id: fields.connect_id.clone(),
+    })
+}
+
 #[cfg(test)]
 fn event_name_at_record_start(line: &str) -> Option<String> {
     let bytes = line.as_bytes();
@@ -1111,7 +1267,10 @@ fn event_name_at_record_start_bytes(bytes: &[u8]) -> Option<&[u8]> {
 }
 
 fn is_target_event(event_name: &[u8]) -> bool {
-    event_name == b"CALL" || event_name == b"SDBL"
+    matches!(
+        event_name,
+        b"CALL" | b"SDBL" | b"VRSREQUEST" | b"VRSRESPONSE"
+    )
 }
 
 fn append_record_line(record: &mut String, bytes: &[u8], strip_bom: bool) {
@@ -1196,19 +1355,37 @@ fn extract_fields(record: &str, fields_start: usize, event_name: &str) -> Parsed
 }
 
 fn is_relevant_field(event_name: &str, name: &str) -> bool {
-    matches!(name, "Usr" | "SessionID" | "Context" | "CpuTime" | "Func")
-        || (event_name == "CALL"
-            && matches!(
-                name,
-                "IName" | "MName" | "Module" | "Method" | "Form" | "FormItem"
-            ))
+    matches!(
+        name,
+        "Usr"
+            | "SessionID"
+            | "process"
+            | "p:processName"
+            | "OSThread"
+            | "t:clientID"
+            | "t:connectID"
+            | "Context"
+            | "CpuTime"
+            | "Func"
+    ) || (event_name == "CALL"
+        && matches!(
+            name,
+            "IName" | "MName" | "Module" | "Method" | "Form" | "FormItem"
+        ))
         || (event_name == "SDBL" && matches!(name, "Sdbl" | "tableName"))
+        || (event_name == "VRSREQUEST" && matches!(name, "Method" | "URI"))
+        || (event_name == "VRSRESPONSE" && name == "Status")
 }
 
 fn set_field(fields: &mut ParsedFields, event_name: &str, name: &str, value: String) {
     match name {
         "Usr" => fields.usr = value,
         "SessionID" => fields.session_id = value,
+        "process" => fields.process = value,
+        "p:processName" => fields.process_name = value,
+        "OSThread" => fields.os_thread = value,
+        "t:clientID" => fields.client_id = value,
+        "t:connectID" => fields.connect_id = value,
         "Context" => fields.context = value,
         "CpuTime" => fields.cpu_time = value,
         "Func" => fields.func = value,
@@ -1220,6 +1397,9 @@ fn set_field(fields: &mut ParsedFields, event_name: &str, name: &str, value: Str
         "FormItem" if event_name == "CALL" => fields.form_item = value,
         "Sdbl" if event_name == "SDBL" => fields.sdbl = value,
         "tableName" if event_name == "SDBL" => fields.table_name = value,
+        "Method" if event_name == "VRSREQUEST" => fields.vrs_method = value,
+        "URI" if event_name == "VRSREQUEST" => fields.uri = value,
+        "Status" if event_name == "VRSRESPONSE" => fields.status = value,
         _ => {}
     }
 }
@@ -1401,6 +1581,32 @@ fn event_datetime(date: Option<&FileDate>, time: &str) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
         date.year, date.month, date.day, date.hour, minute, second, micro
     )
+}
+
+fn duration_between_event_times_us(start: &str, end: &str) -> u64 {
+    let Some(start_us) = event_time_offset_us(start) else {
+        return 0;
+    };
+    let Some(end_us) = event_time_offset_us(end) else {
+        return 0;
+    };
+    end_us.saturating_sub(start_us)
+}
+
+fn event_time_offset_us(time: &str) -> Option<u64> {
+    let minute = time.get(0..2)?.parse::<u64>().ok()?;
+    let second = time.get(3..5)?.parse::<u64>().ok()?;
+    let micro = time
+        .find('.')
+        .map(|dot| {
+            let mut frac = time[dot + 1..].chars().take(6).collect::<String>();
+            while frac.len() < 6 {
+                frac.push('0');
+            }
+            frac.parse::<u64>().ok()
+        })
+        .unwrap_or(Some(0))?;
+    Some((minute * 60 + second) * 1_000_000 + micro)
 }
 
 fn collect_log_files(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -2041,6 +2247,66 @@ mod tests {
         assert_eq!(event.method, "M");
         assert_eq!(event.cpu_time_us, 12);
         assert_eq!(event.place, "Call: F I IN MN M");
+    }
+
+    #[test]
+    fn pairs_vrs_request_response_as_single_event() {
+        let request = "05:51.386087-0,VRSREQUEST,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Method=POST,URI='/e1cib/logForm?cmd=callWOContext',Headers='A: 1\nB: 2',Body=400";
+        let response = "05:51.401002-0,VRSRESPONSE,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Status=200,Phrase=OK,Headers='Content-Length: 330\nContent-Type: application/xml',Body=330";
+
+        let (key, pending) =
+            parse_vrs_request(request, "a.log", 10, parse_header(request).unwrap(), false).unwrap();
+        let mut pending_vrs = HashMap::new();
+        pending_vrs.insert(key, pending);
+
+        let event = parse_vrs_response(
+            response,
+            Some(&date()),
+            parse_header(response).unwrap(),
+            &mut pending_vrs,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(event.event_name, "VRSREQRESP");
+        assert_eq!(event.line_no, 10);
+        assert_eq!(event.event_key, "a.log|10");
+        assert_eq!(event.place, "POST /e1cib/logForm?cmd=callWOContext");
+        assert_eq!(event.first_context_line, "200");
+        assert_eq!(event.func, "");
+        assert_eq!(event.method, "");
+        assert_eq!(event.query_text, "");
+        assert_eq!(event.stack_text, "");
+        assert_eq!(event.duration_us, 14915);
+        assert!(pending_vrs.is_empty());
+    }
+
+    #[test]
+    fn vrs_response_without_request_is_not_imported() {
+        let response = "05:51.401002-0,VRSRESPONSE,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Status=200,Headers='Content-Length: 330',Body=330";
+        let mut pending_vrs = HashMap::new();
+        assert!(
+            parse_vrs_response(
+                response,
+                Some(&date()),
+                parse_header(response).unwrap(),
+                &mut pending_vrs,
+                false
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn vrs_duration_uses_request_and_response_times() {
+        assert_eq!(
+            duration_between_event_times_us("05:51.386087", "05:51.401002"),
+            14915
+        );
+        assert_eq!(
+            duration_between_event_times_us("05:51.401002", "05:51.386087"),
+            0
+        );
     }
 
     #[test]
