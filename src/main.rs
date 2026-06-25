@@ -1178,7 +1178,14 @@ fn parse_vrs_response(
     let fields = extract_fields(record, header.fields_start, &header.event_name);
     let key = vrs_key(&fields)?;
     let request = pending_vrs.remove(&key)?;
-    let place = [request.method.trim(), request.uri.trim()]
+    let full_uri = request.uri.trim();
+    let normalized_uri = normalize_vrs_uri(full_uri);
+    let place = [request.method.trim(), normalized_uri.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stack_text = [request.method.trim(), full_uri]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
@@ -1218,7 +1225,7 @@ fn parse_vrs_response(
         place: truncate_chars(&place, 1000),
         first_context_line: truncate_chars(&fields.status, 1000),
         query_text: String::new(),
-        stack_text: String::new(),
+        stack_text,
         file_path: request.file_path,
         raw_record,
     })
@@ -1581,6 +1588,50 @@ fn event_datetime(date: Option<&FileDate>, time: &str) -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}",
         date.year, date.month, date.day, date.hour, minute, second, micro
     )
+}
+
+fn normalize_vrs_uri(uri: &str) -> String {
+    let without_query = uri.split_once('?').map(|(path, _)| path).unwrap_or(uri);
+    replace_guids(without_query)
+}
+
+fn replace_guids(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        if is_guid_at(bytes, pos) {
+            out.push_str("<GUID>");
+            pos += 36;
+        } else {
+            let ch = value[pos..].chars().next().expect("valid utf-8 boundary");
+            out.push(ch);
+            pos += ch.len_utf8();
+        }
+    }
+    out
+}
+
+fn is_guid_at(bytes: &[u8], start: usize) -> bool {
+    if start + 36 > bytes.len() {
+        return false;
+    }
+    for rel in 0..36 {
+        let byte = bytes[start + rel];
+        match rel {
+            8 | 13 | 18 | 23 => {
+                if byte != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !byte.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn duration_between_event_times_us(start: &str, end: &str) -> u64 {
@@ -2251,7 +2302,7 @@ mod tests {
 
     #[test]
     fn pairs_vrs_request_response_as_single_event() {
-        let request = "05:51.386087-0,VRSREQUEST,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Method=POST,URI='/e1cib/logForm?cmd=callWOContext',Headers='A: 1\nB: 2',Body=400";
+        let request = "05:51.386087-0,VRSREQUEST,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Method=POST,URI='/e1cib/tempstorage/7f2e45b3-4250-476f-b81c-4aa61860db83?seanceId=abc',Headers='A: 1\nB: 2',Body=400";
         let response = "05:51.401002-0,VRSRESPONSE,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Status=200,Phrase=OK,Headers='Content-Length: 330\nContent-Type: application/xml',Body=330";
 
         let (key, pending) =
@@ -2271,14 +2322,68 @@ mod tests {
         assert_eq!(event.event_name, "VRSREQRESP");
         assert_eq!(event.line_no, 10);
         assert_eq!(event.event_key, "a.log|10");
-        assert_eq!(event.place, "POST /e1cib/logForm?cmd=callWOContext");
+        assert_eq!(event.place, "POST /e1cib/tempstorage/<GUID>");
         assert_eq!(event.first_context_line, "200");
         assert_eq!(event.func, "");
         assert_eq!(event.method, "");
         assert_eq!(event.query_text, "");
-        assert_eq!(event.stack_text, "");
+        assert_eq!(
+            event.stack_text,
+            "POST /e1cib/tempstorage/7f2e45b3-4250-476f-b81c-4aa61860db83?seanceId=abc"
+        );
+        assert_eq!(event.raw_record, "");
         assert_eq!(event.duration_us, 14915);
         assert!(pending_vrs.is_empty());
+    }
+
+    #[test]
+    fn normalizes_vrs_uri_for_place() {
+        assert_eq!(
+            normalize_vrs_uri(
+                "/e1cib/tempstorage/7f2e45b3-4250-476f-b81c-4aa61860db83?seanceId=abc"
+            ),
+            "/e1cib/tempstorage/<GUID>"
+        );
+        assert_eq!(
+            normalize_vrs_uri(
+                "/e1cib/logForm?cmd=dataDescrWMethods&formId=urn:form:md:0:25879f4f-5d1d-4584-b34b-c586052da845"
+            ),
+            "/e1cib/logForm"
+        );
+        assert_eq!(
+            normalize_vrs_uri(
+                "/e1cib/modules/call?id=urn%3Amodule%3Amd%3Aec6ed9cb-85a2-4303-9906-cfb4ce6500bf%40property"
+            ),
+            "/e1cib/modules/call"
+        );
+        assert_eq!(
+            normalize_vrs_uri("/e1cib/files/ABCDEF12-3456-7890-abcd-ABCDEFABCDEF"),
+            "/e1cib/files/<GUID>"
+        );
+    }
+
+    #[test]
+    fn vrs_store_raw_record_keeps_raw_request_and_response() {
+        let request = "05:51.386087-0,VRSREQUEST,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Method=GET,URI='/e1cib/logForm?cmd=callWOContext',Headers='A: 1',Body=0";
+        let response = "05:51.401002-0,VRSRESPONSE,3,level=INFO,process=rphost,p:processName=svatest,OSThread=111376,t:clientID=331061,t:connectID=5381606,Status=200,Headers='Content-Length: 0',Body=0";
+        let (key, pending) =
+            parse_vrs_request(request, "a.log", 10, parse_header(request).unwrap(), true).unwrap();
+        let mut pending_vrs = HashMap::new();
+        pending_vrs.insert(key, pending);
+
+        let event = parse_vrs_response(
+            response,
+            Some(&date()),
+            parse_header(response).unwrap(),
+            &mut pending_vrs,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(event.place, "GET /e1cib/logForm");
+        assert_eq!(event.stack_text, "GET /e1cib/logForm?cmd=callWOContext");
+        assert!(event.raw_record.contains("VRSREQUEST"));
+        assert!(event.raw_record.contains("VRSRESPONSE"));
     }
 
     #[test]

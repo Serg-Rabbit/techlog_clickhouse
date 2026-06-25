@@ -147,7 +147,7 @@ cargo run --release -- import --path "Файлы техжурнала" --host lo
 
 Импорт делает только создание схемы, опциональную очистку `techlog.events`, потоковое чтение `.log` файлов и батчевую вставку `CALL`, `SDBL` и свернутых HTTP-пар `VRSREQUEST/VRSRESPONSE` как `VRSREQRESP` в ClickHouse.
 
-Для `VRSREQRESP` поле `place` заполняется как `Method URI`, а `first_context_line` содержит HTTP-статус ответа.
+Для `VRSREQRESP` поле `place` заполняется как `Method URI` без query-параметров и с заменой GUID на `<GUID>`, `first_context_line` содержит HTTP-статус ответа, а полный исходный `Method URI` сохраняется в `stack_text`.
 
 Импорт по умолчанию оптимизирован по скорости:
 
