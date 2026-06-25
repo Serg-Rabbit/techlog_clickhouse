@@ -14,6 +14,7 @@ const DEFAULT_BATCH_ROWS: usize = 100_000;
 const DEFAULT_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_WATCH_POLL_SECONDS: u64 = 5;
 const DEFAULT_WATCH_STABLE_SECONDS: u64 = 10;
+const DEFAULT_EXTRACT_PATH: &str = "/tmp/techlog-loader";
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -34,6 +35,7 @@ struct Config {
     watch_stable_seconds: u64,
     http_listen: Option<String>,
     upload_token: Option<String>,
+    extract_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +176,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
         watch_stable_seconds: DEFAULT_WATCH_STABLE_SECONDS,
         http_listen: None,
         upload_token: None,
+        extract_path: PathBuf::from(DEFAULT_EXTRACT_PATH),
     };
 
     if args.is_empty() {
@@ -262,6 +265,10 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                 i += 1;
                 cfg.upload_token = Some(value_at(&args, i, "--upload-token")?.to_string());
             }
+            "--extract-path" => {
+                i += 1;
+                cfg.extract_path = PathBuf::from(value_at(&args, i, "--extract-path")?);
+            }
             "-h" | "--help" => cfg.command = Command::Help,
             other => return Err(format!("unknown option: {other}")),
         }
@@ -302,7 +309,7 @@ fn value_at<'a>(args: &'a [String], index: usize, option: &str) -> Result<&'a st
 
 fn print_help() {
     println!(
-        "Использование:\n  cargo run --release -- schema [--host localhost --port 8123 --database techlog --user techlog --password techlog]\n  cargo run --release -- import --path \"Файлы техжурнала\" [--truncate] [--insert-format tsv|json] [--store-raw-record]\n  cargo run --release -- watch --path \"/inbox\" [--watch-poll-seconds 5] [--watch-stable-seconds 10] [--http-listen 0.0.0.0:8081 --upload-token secret]\n  cargo run --release -- scan --path \"Файлы техжурнала\" [--count-lines]"
+        "Использование:\n  cargo run --release -- schema [--host localhost --port 8123 --database techlog --user techlog --password techlog]\n  cargo run --release -- import --path \"Файлы техжурнала\" [--truncate] [--insert-format tsv|json] [--store-raw-record]\n  cargo run --release -- watch --path \"/inbox\" [--watch-poll-seconds 5] [--watch-stable-seconds 10] [--extract-path /tmp/techlog-loader] [--http-listen 0.0.0.0:8081 --upload-token secret]\n  cargo run --release -- scan --path \"Файлы техжурнала\" [--count-lines]"
     );
 }
 
@@ -490,9 +497,9 @@ fn collect_watch_files(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn process_watch_path(path: &Path, inbox: &Path, cfg: &Config) -> Result<(), String> {
+fn process_watch_path(path: &Path, _inbox: &Path, cfg: &Config) -> Result<(), String> {
     if is_zip_file(path) {
-        process_watch_zip(path, inbox, cfg)?;
+        process_watch_zip(path, cfg)?;
     } else if is_log_file(path) {
         import_watch_log(path, cfg)?;
         fs::remove_file(path).map_err(|e| format!("remove {} failed: {e}", path.display()))?;
@@ -500,11 +507,11 @@ fn process_watch_path(path: &Path, inbox: &Path, cfg: &Config) -> Result<(), Str
     Ok(())
 }
 
-fn process_watch_zip(path: &Path, inbox: &Path, cfg: &Config) -> Result<(), String> {
-    let extract_root = inbox.join("_extracted");
+fn process_watch_zip(path: &Path, cfg: &Config) -> Result<(), String> {
+    let extract_root = &cfg.extract_path;
     fs::create_dir_all(&extract_root)
         .map_err(|e| format!("create {} failed: {e}", extract_root.display()))?;
-    let archive_dir = extract_root.join(safe_archive_dir_name(path));
+    let archive_dir = archive_extract_dir(extract_root, path);
     if archive_dir.exists() {
         ensure_child_path(&extract_root, &archive_dir)?;
         fs::remove_dir_all(&archive_dir)
@@ -1498,6 +1505,10 @@ fn ensure_child_path(root: &Path, child: &Path) -> Result<(), String> {
     }
 }
 
+fn archive_extract_dir(extract_root: &Path, archive_path: &Path) -> PathBuf {
+    extract_root.join(safe_archive_dir_name(archive_path))
+}
+
 fn safe_archive_dir_name(path: &Path) -> String {
     let stem = path
         .file_stem()
@@ -1505,13 +1516,14 @@ fn safe_archive_dir_name(path: &Path) -> String {
         .unwrap_or_else(|| "archive".into());
     let mut out = String::new();
     for ch in stem.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+        if ch.is_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | '(' | ')') {
             out.push(ch);
         } else {
             out.push('_');
         }
     }
-    if out.is_empty() {
+    let out = out.trim_matches([' ', '.']).to_string();
+    if out.is_empty() || out == ".." || out.contains("..") {
         "archive".to_string()
     } else {
         out
@@ -1909,6 +1921,29 @@ mod tests {
         let err = extract_zip(&zip_path, &dest).unwrap_err();
         assert!(err.contains("unsafe zip path"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn archive_dir_name_preserves_unicode_letters() {
+        let path = Path::new("ТехЖурнал 26061518.zip");
+        assert_eq!(safe_archive_dir_name(path), "ТехЖурнал 26061518");
+    }
+
+    #[test]
+    fn archive_dir_name_sanitizes_unsafe_names() {
+        assert_eq!(safe_archive_dir_name(Path::new("bad:name.zip")), "bad_name");
+        assert_eq!(safe_archive_dir_name(Path::new("..zip")), "archive");
+        assert_eq!(safe_archive_dir_name(Path::new("...zip")), "archive");
+    }
+
+    #[test]
+    fn archive_extract_dir_uses_configured_extract_root() {
+        let root = Path::new("/tmp/techlog-loader");
+        let archive = Path::new("/inbox/ТехЖурнал 26061518.zip");
+        assert_eq!(
+            archive_extract_dir(root, archive),
+            Path::new("/tmp/techlog-loader").join("ТехЖурнал 26061518")
+        );
     }
 
     #[test]
