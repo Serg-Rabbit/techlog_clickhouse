@@ -29,10 +29,14 @@ CREATE TABLE IF NOT EXISTS techlog.events
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMM(event_dt)
-ORDER BY (event_dt, event_name, place);
+ORDER BY (event_dt, event_name, place)
+TTL event_dt + INTERVAL 1 MONTH;
 
 ALTER TABLE techlog.events
     ADD COLUMN IF NOT EXISTS usr String AFTER stack_text;
 
 ALTER TABLE techlog.events
     ADD COLUMN IF NOT EXISTS session_id String AFTER usr;
+
+ALTER TABLE techlog.events
+    MODIFY TTL event_dt + INTERVAL 1 MONTH;

@@ -105,6 +105,8 @@ ports:
 cargo run --release -- schema --host localhost --port 8123 --database techlog --user techlog --password techlog
 ```
 
+В `techlog.events` включен TTL: события хранятся примерно 1 месяц по `event_dt`. ClickHouse удаляет устаревшие данные фоном во время merge, поэтому очистка не происходит мгновенно ровно по расписанию.
+
 Проверить доступность ClickHouse:
 
 ```powershell
